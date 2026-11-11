@@ -1,18 +1,18 @@
 {
-  "version": "v2.0.0-kit.1",
+  "version": "v2.0.0-kit.2",
   "sdkVersion": "2.0.0",
   "language": "mercury",
   "portable": false,
   "engine": {
-    "file": "clunkyard-engine-v2.0.0-kit.1.tar.gz",
-    "url": "https://github.com/clunkyard/game-kit/releases/download/v2.0.0-kit.1/clunkyard-engine-v2.0.0-kit.1.tar.gz",
+    "file": "clunkyard-engine-v2.0.0-kit.2.tar.gz",
+    "url": "https://github.com/clunkyard/game-kit/releases/download/v2.0.0-kit.2/clunkyard-engine-v2.0.0-kit.2.tar.gz",
     "bytes": 7071301,
     "sha256": "0b9cfa6958a952c32388602821ec4275e61400255f91b212f9c2a9220f8a0d86",
     "expandedBytes": 33794538
   },
   "sdk": {
-    "file": "clunkyard-sdk-mercury-linux-x64-v2.0.0-kit.1.tar.gz",
-    "url": "https://github.com/clunkyard/game-kit/releases/download/v2.0.0-kit.1/clunkyard-sdk-mercury-linux-x64-v2.0.0-kit.1.tar.gz",
+    "file": "clunkyard-sdk-mercury-linux-x64-v2.0.0-kit.2.tar.gz",
+    "url": "https://github.com/clunkyard/game-kit/releases/download/v2.0.0-kit.2/clunkyard-sdk-mercury-linux-x64-v2.0.0-kit.2.tar.gz",
     "bytes": 7764270,
     "sha256": "bcb7204c2d6c09efadea0bfe03d510a021a867e74393e4e81b6d831b520bf20c",
     "expandedBytes": 53797970
@@ -23,6 +23,8 @@
   "tools": [
     "node",
     "make",
-    "mmc"
-  ]
+    "mmc",
+    "cc"
+  ],
+  "requirements": {}
 }
