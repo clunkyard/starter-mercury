@@ -46,7 +46,7 @@
 :- import_module io.
 :- pred main(io::di, io::uo) is det.
 :- implementation.
-:- import_module clunkyard, float, int, math, uint64.
+:- import_module clunkyard, float, int.
 
 :- pred number(pred(robot, float_ref, int, io, io)::in(pred(in, in, out, di, uo) is det), robot::in, float::out, io::di, io::uo) is det.
 number(Query, R, Value, !IO) :- new_float_ref(Out, !IO), Query(R, Out, Status, !IO), check(R, Status, !IO), read_float_ref(Out, Value, !IO).
@@ -124,20 +124,4 @@ turn(R, !IO) :-
             (if Shape = cy_shape_sphere then angle(cy_angles_elevation_to, R, Position, CenterZ, ZoneElevation, !IO) else ZoneElevation = 0.0),
             steer(R, Back, Heading, 30.0, ZoneTurn, !IO), clamp(R, (ZoneElevation - Pitch) / 30.0, ZoneClimb, !IO), drive(R, 0.8, ZoneTurn, ZoneClimb, !IO)
         else true)
-    else true),
-    % Only the arena's rate calibration sends this; safe to delete.
-    text_buffer("state.calibration.work", Path, PathLength, !IO), new_float_ref(WorkRef, !IO), cy_raw_number(R, Path, PathLength, WorkRef, WS, !IO), read_float_ref(WorkRef, Work, !IO),
-    (if WS = cy_ok, Work >= 1.0, Work = float.float(float.floor_to_int(Work)) then calibration_work(float.floor_to_int(Work), Tick, Out), status_value(R, "WORK", float.float(Out), !IO) else true).
-
-% The calibration kernel, xorshift-sqrt v1: work rounds of a 64-bit
-% xorshift and a square-root sum.
-:- pred calibration_work(int::in, int::in, int::out) is det.
-calibration_work(Work, Tick, Out) :-
-    calibration_rounds(Work, 88172645463325252u64 `xor` uint64.cast_from_int(Tick), X, 0.0, Sum),
-    Out = (float.floor_to_int(Sum) + uint64.cast_to_int(X >> 40)) mod 1000000.
-:- pred calibration_rounds(int::in, uint64::in, uint64::out, float::in, float::out) is det.
-calibration_rounds(N, !X, !Sum) :-
-    (if N > 0 then
-        !:X = !.X `xor` (!.X << 13), !:X = !.X `xor` (!.X >> 7), !:X = !.X `xor` (!.X << 17),
-        !:Sum = !.Sum + math.sqrt(float.cast_from_uint64(!.X >> 11)), calibration_rounds(N - 1, !X, !Sum)
     else true).
