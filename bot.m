@@ -1,5 +1,10 @@
 % A robot on the Clunkyard core's Mercury binding. The core owns tracking,
 % geometry and protocol handling; this strategy chooses the tactics.
+% Bearing is earned: a scan contact's bearing is off by up to its
+% bearing error (degrees, a fixed share of the arc), so a wide beam finds a
+% robot and a narrow one aims at it. The robot narrows the beam, holds it
+% on the target and aims along a line fitted through its recent sightings.
+% Contacts within 120 units are exact.
 % Clunkyard robot API 2.0.0: one core under every language, the same
 % answers everywhere. Facts (a call shows its arguments):
 % match: mode ruleset control robots is_3d tick_rate max_ticks
@@ -48,11 +53,78 @@
 :- import_module io.
 :- pred main(io::di, io::uo) is det.
 :- implementation.
-:- import_module bool, clunkyard, float, int, list, string.
+:- import_module bool, clunkyard, float, int, list, maybe, math, string.
+
+:- func search_arc = float.
+search_arc = 40.0.      % degrees: sweeps the circle in half a second
+:- func hold_width = float.
+hold_width = 60.0.      % units across at the target: it stays in the beam from tick to tick
+:- func min_arc = float.
+min_arc = 6.0.          % degrees: the narrowest the beam holds
+:- func window = int.
+window = 12.            % ticks of sightings the aim averages
+:- func sightings = int.
+sightings = 8.          % narrow sightings in the window before a shot
+:- func look_every = int.
+look_every = 40.        % ticks between looks around the target, for a nearer robot
+:- func reacquire = int.
+reacquire = 10.         % ticks to look again where a lost target was
 
 % Dodges taken, and the tick the current one ends.
 :- mutable(dodges, int, 0, ground, [untrailed, attach_to_io_state]).
 :- mutable(dodge_end, int, 0, ground, [untrailed, attach_to_io_state]).
+% The last target's slot, for looking again where it was lost.
+:- mutable(slot, int, 0, ground, [untrailed, attach_to_io_state]).
+
+% One sighting: its tick, its bearing error and where it put the robot.
+:- type reading ---> reading(at :: int, err :: float, px :: float, py :: float, pz :: float).
+% A fitted line: the sightings it rests on, where the robot is now and how fast it moves.
+:- type sightline ---> sightline(count :: int, lx :: float, ly :: float, lz :: float, vx :: float, vy :: float, vz :: float).
+
+:- pred read_readings(cy_sighting::in, int::in, int::in, list(reading)::out, io::di, io::uo) is det.
+read_readings(History, I, N, Readings, !IO) :-
+    (if I >= N then Readings = []
+    else
+        sighting_at(History, I, S, !IO), sighting_tick(S, Tick, !IO), sighting_bearing_error(S, Error, !IO),
+        sighting_position(S, P, !IO), vec3_x(P, X, !IO), vec3_y(P, Y, !IO), vec3_z(P, Z, !IO),
+        read_readings(History, I + 1, N, Rest, !IO), Readings = [reading(Tick, Error, X, Y, Z) | Rest]).
+
+% Axis 0, 1 and 2 are x, y and z; 3 is the tick.
+:- func value(int, reading) = float.
+value(Axis, R) = (if Axis = 0 then R ^ px else if Axis = 1 then R ^ py else if Axis = 2 then R ^ pz else float.float(R ^ at)).
+:- func total(int, list(reading)) = float.
+total(_, []) = 0.0.
+total(Axis, [R | Rs]) = value(Axis, R) + total(Axis, Rs).
+% The sum of (tick - t0) * (value - mean) over the sightings; with Axis 3 and mean t0, their spread.
+:- func around(int, float, float, list(reading)) = float.
+around(_, _, _, []) = 0.0.
+around(Axis, T0, Mean, [R | Rs]) = (value(3, R) - T0) * (value(Axis, R) - Mean) + around(Axis, T0, Mean, Rs).
+:- func recent(int, list(reading)) = list(reading).
+recent(_, []) = [].
+recent(Since, [R | Rs]) = (if R ^ at > Since then [R | recent(Since, Rs)] else recent(Since, Rs)).
+:- func narrow(float, list(reading)) = list(reading).
+narrow(_, []) = [].
+narrow(Limit, [R | Rs]) = (if R ^ err =< Limit then [R | narrow(Limit, Rs)] else narrow(Limit, Rs)).
+:- func least(list(reading)) = float.
+least([]) = 0.0.
+least([R | Rs]) = (if Rs = [] then R ^ err else float.min(R ^ err, least(Rs))).
+
+% A straight line through the narrowest of the last window ticks' sightings:
+% where the robot is now and how fast it moves. Each sighting is off by its
+% bearing error; the line averages that out.
+:- func fit(int, int, list(reading)) = maybe(sightline).
+fit(Tick, Rate, Readings) = Fit :-
+    Recent = recent(Tick - window, Readings),
+    Seen = narrow(1.5 * least(Recent), Recent),                 % the narrow ones
+    (if Recent = [_, _ | _], Seen = [_, _ | _] then
+        N = float.float(list.length(Seen)), T0 = total(3, Seen) / N, Spread = around(3, T0, T0, Seen),
+        MeanX = total(0, Seen) / N, SlopeX = around(0, T0, MeanX, Seen) / Spread,
+        MeanY = total(1, Seen) / N, SlopeY = around(1, T0, MeanY, Seen) / Spread,
+        MeanZ = total(2, Seen) / N, SlopeZ = around(2, T0, MeanZ, Seen) / Spread,
+        Ahead = float.float(Tick) - T0, PerSecond = float.float(Rate),
+        Fit = yes(sightline(list.length(Seen), MeanX + SlopeX * Ahead, MeanY + SlopeY * Ahead, MeanZ + SlopeZ * Ahead,
+            SlopeX * PerSecond, SlopeY * PerSecond, SlopeZ * PerSecond))
+    else Fit = no).
 
 :- pred number(pred(robot, float_ref, int, io, io)::in(pred(in, in, out, di, uo) is det), robot::in, float::out, io::di, io::uo) is det.
 number(Query, R, Value, !IO) :- new_float_ref(Out, !IO), Query(R, Out, Status, !IO), check(R, Status, !IO), read_float_ref(Out, Value, !IO).
@@ -99,20 +171,55 @@ turn(R, !IO) :-
     (if TargetStatus = cy_ok then
         contact_range(Target, Range, !IO), contact_bearing(Target, Bearing, !IO), contact_elevation(Target, Elevation, !IO),
         Throttle = (if Range > 350.0 then 0.7 else if Range < 200.0 then -0.4 else 0.2),
-        steer(R, Bearing, Heading, 45.0, Turn, !IO), steer(R, Elevation, Pitch, 45.0, Climb, !IO), drive(R, Throttle, Turn, Climb, !IO), scan(R, Bearing, 20.0, Elevation, !IO),
+        contact_slot(Target, TargetSlot, !IO), set_slot(TargetSlot, !IO), contact_bearing_error(Target, BearingError, !IO),
+        steer(R, Bearing, Heading, 45.0, Turn, !IO), steer(R, Elevation, Pitch, 45.0, Climb, !IO), drive(R, Throttle, Turn, Climb, !IO),
+        % Halve the beam each tick until it is hold_width across at the target:
+        % narrow enough for a precise bearing, wide enough to keep it in.
+        Hold = float.max(min_arc, 2.0 * math.atan2(hold_width / 2.0, Range) * 180.0 / math.pi),
+        new_scan(LastScan, !IO), cy_scanner_last(R, LastScan, LSS, !IO), check(R, LSS, !IO), scan_arc(LastScan, LastArc, !IO),
+        % In a crowd a narrow beam sees one robot. Every look_every ticks,
+        % widen it for a tick: a nearer robot it finds becomes the target.
+        Arc = (if Tick mod look_every = 0 then search_arc else float.max(Hold, float.min(search_arc, LastArc / 2.0))),
+        scan(R, Bearing, Arc, Elevation, !IO),
         new_float_ref(PowerRef, !IO), cy_gun_power_for_flight_time(R, Range, 1.0, PowerRef, PWS, !IO), check(R, PWS, !IO), read_float_ref(PowerRef, Power, !IO),
-        % cy_gun_lead is the intercept if the target holds course.
-        new_solution(Aim, !IO), cy_gun_lead(R, Target, Power, Aim, AS, !IO),
+        % An exact contact: cy_gun_lead is the intercept if the target holds course.
+        % A noisy one: lead the fitted line, and fire only once it rests on enough sightings.
+        new_solution(Aim, !IO),
+        (if BearingError > 0.0 then
+            new_int_ref(RateRef, !IO), cy_match_tick_rate(R, RateRef, RTS, !IO), check(R, RTS, !IO), read_int_ref(RateRef, Rate, !IO),
+            new_sighting_array(32, History, !IO), new_count_ref(HistoryCount, !IO),
+            cy_tracker_history(R, TargetSlot, History, 32, HistoryCount, HS, !IO), check(R, HS, !IO), read_count_ref(HistoryCount, Recorded, !IO),
+            read_readings(History, 0, int.min(Recorded, 32), Readings, !IO),
+            (if fit(Tick, Rate, Readings) = yes(Fit) then
+                set_vec3(Fit ^ lx, Fit ^ ly, Fit ^ lz, Where, !IO), set_vec3(Fit ^ vx, Fit ^ vy, Fit ^ vz, Velocity, !IO),
+                cy_gun_lead_point(R, Where, Velocity, Power, Aim, AS, !IO),
+                Ready = (if Fit ^ count >= sightings then yes else no)
+            else AS = cy_none, Ready = no)
+        else cy_gun_lead(R, Target, Power, Aim, AS, !IO), Ready = yes),
         (if AS = cy_ok then solution_heading(Aim, AimHeading, !IO), solution_pitch(Aim, AimPitch, !IO) else AimHeading = Bearing, AimPitch = Elevation),
         set(cy_gun_aim_heading, R, AimHeading, !IO), set(cy_gun_aim_pitch, R, AimPitch, !IO),
         new_direction(Now, !IO), cy_gun_aim_now(R, Now, NS, !IO), check(R, NS, !IO), direction_heading(Now, NowHeading, !IO), direction_pitch(Now, NowPitch, !IO),
         new_float_ref(DeltaRef, !IO), cy_angles_angle_diff(AimHeading, NowHeading, DeltaRef, DS, !IO), check(R, DS, !IO), read_float_ref(DeltaRef, Delta, !IO),
         new_int_ref(FireRef, !IO), cy_gun_can_fire(R, Power, 10.0, FireRef, FS, !IO), check(R, FS, !IO), read_int_ref(FireRef, CanFire, !IO),
-        (if float.abs(Delta) < 3.0, float.abs(AimPitch - NowPitch) < 3.0, CanFire \= 0 then cy_gun_fire(R, Fired, !IO), check(R, Fired, !IO), set(cy_gun_power, R, Power, !IO) else true),
-        status_value(R, "TRACK", Range, !IO)
+        (if Ready = yes, float.abs(Delta) < 3.0, float.abs(AimPitch - NowPitch) < 3.0, CanFire \= 0 then cy_gun_fire(R, Fired, !IO), check(R, Fired, !IO), set(cy_gun_power, R, Power, !IO) else true),
+        status_value(R, (if Ready = yes then "TRACK" else "NARROW"), Range, !IO)
     else
+        get_slot(Slot, !IO),
+        (if Slot \= 0 then
+            new_int_ref(SeenRef, !IO), cy_tracker_last_seen(R, Slot, SeenRef, SeenStatus, !IO), read_int_ref(SeenRef, SeenAt, !IO),
+            Lost = (if SeenStatus = cy_ok, Tick - SeenAt =< reacquire then yes else no)
+        else Lost = no),
         new_cue(Cue, !IO), cy_tracker_cue(R, Cue, CueStatus, !IO),
-        (if CueStatus = cy_ok then
+        (if Lost = yes then
+            % Lost it: look again where it was last seen, widening the beam, before searching.
+            new_vec3(Remembered, !IO), cy_tracker_position(R, Slot, Remembered, RememberedStatus, !IO),
+            (if RememberedStatus = cy_ok then Where = Remembered else Where = Position),
+            angle(cy_angles_bearing_to, R, Position, Where, Bearing, !IO),
+            (if Free = 1 then angle(cy_angles_elevation_to, R, Position, Where, Elevation, !IO) else Elevation = 0.0),
+            new_scan(LastScan, !IO), cy_scanner_last(R, LastScan, LSS, !IO), check(R, LSS, !IO), scan_arc(LastScan, LastArc, !IO),
+            steer(R, Bearing, Heading, 45.0, Turn, !IO), steer(R, Elevation, Pitch, 45.0, Climb, !IO), drive(R, 0.5, Turn, Climb, !IO),
+            scan(R, Bearing, float.min(search_arc, LastArc * 2.0), Elevation, !IO), status(R, "REACQUIRE", !IO)
+        else if CueStatus = cy_ok then
             cue_position(Cue, Point, !IO), angle(cy_angles_bearing_to, R, Position, Point, Bearing, !IO), angle(cy_angles_distance, R, Position, Point, Distance, !IO),
             (if Free = 1 then angle(cy_angles_elevation_to, R, Position, Point, Elevation, !IO) else Elevation = 0.0),
             cue_bearing_error(Cue, Error, !IO), Spread = float.min(Error, 30.0), Across = float.float(Tick mod 5 - 2) / 2.0 * Spread,
@@ -123,7 +230,7 @@ turn(R, !IO) :-
             new_scan(Last, !IO), cy_scanner_last(R, Last, LS, !IO), check(R, LS, !IO), scan_heading(Last, LastHeading, !IO),
             new_float_ref(SweepRef, !IO), cy_angles_normalize(LastHeading + 36.0, SweepRef, SS, !IO), check(R, SS, !IO), read_float_ref(SweepRef, Sweep, !IO),
             steer(R, 0.0, Pitch, 45.0, Climb, !IO), drive(R, 0.5, 0.33, Climb, !IO),
-            Elevation = (if Free = 1 then float.float((Tick div 10) mod 3 - 1) * 35.0 else 0.0), scan(R, Sweep, 40.0, Elevation, !IO), status(R, "SEARCH", !IO)
+            Elevation = (if Free = 1 then float.float((Tick div 10) mod 3 - 1) * 35.0 else 0.0), scan(R, Sweep, search_arc, Elevation, !IO), status(R, "SEARCH", !IO)
         )
     ),
     % A simple dodge: vary it, or predict the shooter.
