@@ -7,7 +7,8 @@
 % clock: tick seconds remaining_ticks
 % arena: size gravity terrain_kind ground_height(x y)
 % me: health position velocity heading pitch roll angular_velocity
-%   attitude grounded altitude applied
+%   attitude grounded altitude applied hull_mounts to_mount(heading pitch)
+%   from_mount(heading pitch) mount_toward(point)
 % battery: charge capacity regen sustainable_drive compute
 %   drive_cost(fraction)
 % drive: hover_lift
@@ -29,7 +30,8 @@
 % score: me best armour
 % angles: normalize(degrees) angle_diff(target current)
 %   bearing_to(from to) elevation_to(from to) direction(heading pitch)
-%   distance(a b) clamp(value low high)
+%   distance(a b) to_chassis(heading pitch attitude)
+%   from_chassis(heading pitch attitude) clamp(value low high)
 % raw: number(path) text(path) has(path) flag(path) count(path) line()
 % Controls: drive.set(throttle turn pitch_turn)
 %   drive.forces(thrust strafe lift yaw_torque pitch_torque roll_torque brake)
@@ -46,7 +48,11 @@
 :- import_module io.
 :- pred main(io::di, io::uo) is det.
 :- implementation.
-:- import_module clunkyard, float, int.
+:- import_module bool, clunkyard, float, int, list, string.
+
+% Dodges taken, and the tick the current one ends.
+:- mutable(dodges, int, 0, ground, [untrailed, attach_to_io_state]).
+:- mutable(dodge_end, int, 0, ground, [untrailed, attach_to_io_state]).
 
 :- pred number(pred(robot, float_ref, int, io, io)::in(pred(in, in, out, di, uo) is det), robot::in, float::out, io::di, io::uo) is det.
 number(Query, R, Value, !IO) :- new_float_ref(Out, !IO), Query(R, Out, Status, !IO), check(R, Status, !IO), read_float_ref(Out, Value, !IO).
@@ -66,6 +72,16 @@ status(R, Text, !IO) :- text_buffer(Text, Bytes, N, !IO), cy_status_text(R, Byte
 status_value(R, Text, Value, !IO) :- status(R, Text, !IO), set(cy_status_value, R, Value, !IO).
 :- pred angle(pred(cy_vec3, cy_vec3, float_ref, int, io, io)::in(pred(in, in, in, out, di, uo) is det), robot::in, cy_vec3::in, cy_vec3::in, float::out, io::di, io::uo) is det.
 angle(Query, R, A, B, Value, !IO) :- new_float_ref(Out, !IO), Query(A, B, Out, S, !IO), check(R, S, !IO), read_float_ref(Out, Value, !IO).
+:- pred heard_shot(robot::in, bool::out, io::di, io::uo) is det.
+heard_shot(R, Shot, !IO) :-
+    new_contact_array(64, Cues, !IO), new_count_ref(CountRef, !IO),
+    cy_sensors_cues(R, Cues, 64, CountRef, S, !IO), check(R, S, !IO), read_count_ref(CountRef, Count, !IO),
+    muzzle_among(Cues, 0, int.min(Count, 64), Shot, !IO).
+:- pred muzzle_among(cy_contact::in, int::in, int::in, bool::out, io::di, io::uo) is det.
+muzzle_among(Cues, I, N, Shot, !IO) :-
+    (if I >= N then Shot = no
+    else contact_at(Cues, I, Cue, !IO), contact_source(Cue, Source, !IO),
+        (if Source = cy_source_muzzle then Shot = yes else muzzle_among(Cues, I + 1, N, Shot, !IO))).
 :- pred start(robot::in, io::di, io::uo) is det.
 start(_, !IO).
 main(!IO) :- run(turn, start, !IO).
@@ -85,6 +101,7 @@ turn(R, !IO) :-
         Throttle = (if Range > 350.0 then 0.7 else if Range < 200.0 then -0.4 else 0.2),
         steer(R, Bearing, Heading, 45.0, Turn, !IO), steer(R, Elevation, Pitch, 45.0, Climb, !IO), drive(R, Throttle, Turn, Climb, !IO), scan(R, Bearing, 20.0, Elevation, !IO),
         new_float_ref(PowerRef, !IO), cy_gun_power_for_flight_time(R, Range, 1.0, PowerRef, PWS, !IO), check(R, PWS, !IO), read_float_ref(PowerRef, Power, !IO),
+        % cy_gun_lead is the intercept if the target holds course.
         new_solution(Aim, !IO), cy_gun_lead(R, Target, Power, Aim, AS, !IO),
         (if AS = cy_ok then solution_heading(Aim, AimHeading, !IO), solution_pitch(Aim, AimPitch, !IO) else AimHeading = Bearing, AimPitch = Elevation),
         set(cy_gun_aim_heading, R, AimHeading, !IO), set(cy_gun_aim_pitch, R, AimPitch, !IO),
@@ -109,6 +126,20 @@ turn(R, !IO) :-
             Elevation = (if Free = 1 then float.float((Tick div 10) mod 3 - 1) * 35.0 else 0.0), scan(R, Sweep, 40.0, Elevation, !IO), status(R, "SEARCH", !IO)
         )
     ),
+    % A simple dodge: vary it, or predict the shooter.
+    get_dodges(Taken, !IO), get_dodge_end(Ends, !IO), heard_shot(R, Shot, !IO),
+    (if Tick >= Ends, Shot = yes then set_dodges(Taken + 1, !IO), set_dodge_end(Tick + 10, !IO) else true),
+    get_dodges(Dodges, !IO), get_dodge_end(DodgeEnd, !IO),
+    (if Tick < DodgeEnd then
+        % Off the line of fire: left, then right next time (turn is positive left, strafe positive right).
+        Left = (if Dodges mod 2 = 1 then yes else no),
+        new_int_ref(ControlRef, !IO), cy_match_control(R, ControlRef, CS, !IO), check(R, CS, !IO), read_int_ref(ControlRef, Control, !IO),
+        (if Control = cy_control_forces then
+            set(cy_drive_throttle, R, 0.5, !IO), set(cy_drive_strafe, R, (if Left = yes then -1.0 else 1.0), !IO)
+        else
+            set(cy_drive_throttle, R, 1.0, !IO), set(cy_drive_turn, R, (if Left = yes then 1.0 else -1.0), !IO)),
+        status_value(R, (if Left = yes then "dodge:left" else "dodge:right"), float.float(Dodges), !IO)
+    else true),
     number(cy_battery_charge, R, Charge, !IO), number(cy_battery_capacity, R, Capacity, !IO),
     (if Charge < Capacity / 4.0 then number(cy_drive_get_throttle, R, ThrottleNow, !IO), set(cy_drive_throttle, R, ThrottleNow * 0.5, !IO) else true),
     new_storm(Storm, !IO), cy_nav_storm(R, Storm, StormStatus, !IO), new_float_ref(MarginRef, !IO),
